@@ -78,15 +78,20 @@ def load_existing_seeds():
     return [np.array(p1), np.array(p2)]
     
 # ------------------ 核心保存逻辑 ------------------
-def save_archive_step(iter_num, X_front, F_front, seeds_X, seeds_F, eps=0.0):
-    X_all = np.concatenate([np.asarray(X_front), np.asarray(seeds_X)], axis=0)
-    F_all = np.concatenate([np.asarray(F_front), np.asarray(seeds_F)], axis=0)
-    nd_mask = non_dominated_mask(F_all, eps=eps)
-    X_nd, F_nd = X_all[nd_mask], F_all[nd_mask]
+def save_archive_step(iter_num, x_pop, scores):
+    ckpt_dir = os.path.join(SAVE_DIR, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    save_path = os.path.join(ckpt_dir, f"pop_gen_{iter_num:05d}.pkl")
+    with open(save_path, "wb") as f:
+        pickle.dump({"X": x_pop, "S": scores}, f)
+
+    latest_path = os.path.join(SAVE_DIR, "latest_pop.pkl")
+    with open(latest_path, "wb") as f:
+        pickle.dump({"X": x_pop, "S": scores}, f)
 
 # ------------------ 全局解的历史轨迹图 ------------------
 def plot_all_evolution(global_archive):
-    """绘制演化图：新版精简了图层，去除了轨迹线"""
     if not global_archive["S"]:
         return
     
