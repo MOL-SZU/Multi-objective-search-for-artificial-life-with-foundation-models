@@ -157,8 +157,12 @@ def run_moo_with_seeds(seeds):
         X_init = np.random.uniform(-1, 1, (POP_SIZE, substrate.n_params))
         p1, p2 = seeds[0], seeds[1]
         num_per_seed, noise_std = 10, 0.005
-        for i in range(num_per_seed):
-            X_init[i] = np.clip(p1 + np.random.normal(0, noise_std, p1.shape), -1, 1) # 这里全部加了噪声
+        
+        X_init[0] = p1
+        X_init[num_per_seed] = p2
+        
+        for i in range(1, num_per_seed):
+            X_init[i] = np.clip(p1 + np.random.normal(0, noise_std, p1.shape), -1, 1)
             X_init[num_per_seed + i] = np.clip(p2 + np.random.normal(0, noise_std, p2.shape), -1, 1)
 
     pop_init = Population.new("X", X_init)
