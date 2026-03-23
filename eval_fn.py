@@ -14,7 +14,7 @@ def encode_prompts(fm, prompts: list[str]) -> list[jnp.ndarray]:
     """
     z_txt_list = []
     for p in prompts:
-        z = fm.encode_text(p)
+        z = fm.embed_txt(p)
         z = jnp.atleast_2d(z)
         z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
         z_txt_list.append(z)
@@ -51,17 +51,11 @@ def build_rollout_fn(substrate, fm, time_sampling=8):
 
 def get_substrate_bounds(param_cls) -> tuple[np.ndarray, np.ndarray]:
     """
-    Read the physically valid hard bounds from the substrate parameter class.
-    This is the first layer of bounds (hard constraint).
-    compute_bounds_from_seeds narrows within these limits.
-
-    Parameters
-    ----------
-    param_cls : FlattenSubstrateParameters class (not an instance)
+    FlattenSubstrateParameters does not provide explicit bounds.
+    Lenia parameters range approximately [-12, 8], far outside [0, 1].
+    Return None so compute_bounds_from_seeds uses only seed-based soft bounds.
     """
-    template = param_cls()
-    xl, xu = template.get_bounds()
-    return np.asarray(xl, dtype=np.float64), np.asarray(xu, dtype=np.float64)
+    return None, None
 
 
 def compute_bounds_from_seeds(
@@ -90,25 +84,25 @@ def compute_bounds_from_seeds(
     inner_sub = getattr(substrate, 'substrate', substrate)
     n_var     = seeds.shape[1]
 
-    assert hasattr(inner_sub, 'n_params_dyn'), (
-        f"{type(inner_sub).__name__} has no attribute 'n_params_dyn'. "
-        "Cannot distinguish dynamic-rule dimensions from initial-state dimensions."
-    )
-    DYN_DIM = int(inner_sub.n_params_dyn)
+    # If substrate has no n_params_dyn, treat all dimensions as
+    # dynamic-rule parameters (e.g. Lenia has no separate init-state params)
+    DYN_DIM = int(getattr(inner_sub, 'n_params_dyn', n_var))
 
     xl = np.empty(n_var, dtype=np.float64)
     xu = np.empty(n_var, dtype=np.float64)
 
-    # Dynamic-rule dimensions: tighter margin
+    # Dynamic-rule dimensions
     xl[:DYN_DIM] = seeds[:, :DYN_DIM].min(axis=0) - dyn_margin
     xu[:DYN_DIM] = seeds[:, :DYN_DIM].max(axis=0) + dyn_margin
 
-    # Initial-state dimensions: wider margin
+    # Initial-state dimensions (only if substrate distinguishes them)
     if DYN_DIM < n_var:
         xl[DYN_DIM:] = seeds[:, DYN_DIM:].min(axis=0) - init_margin
         xu[DYN_DIM:] = seeds[:, DYN_DIM:].max(axis=0) + init_margin
+        print(f"[Bounds] dyn_dim={DYN_DIM}, init_dim={n_var - DYN_DIM}")
+    else:
+        print(f"[Bounds] All {n_var} dimensions treated as dynamic-rule parameters.")
 
-    # Intersect with hard bounds to stay within valid parameter space
     if global_xl is not None:
         xl = np.maximum(xl, global_xl)
     if global_xu is not None:
@@ -158,7 +152,7 @@ def generate_parents_from_optimum(
         xu  = np.asarray(xu, dtype=np.float64)
         std = noise_scale * (xu - xl)
     else:
-        std = noise_scale * np.ones(n_var)
+        std = noise_scale * (np.abs(x_star) + 1.0)
 
     noise   = rng.normal(loc=0.0, scale=std, size=(n_parents, n_var))
     parents = x_star[None, :] + noise
