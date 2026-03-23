@@ -20,10 +20,13 @@ from eval_fn import (
     generate_parents_from_optimum,
 )
 
-
 # =============================================================================
 # Configuration
 # =============================================================================
+
+SUBSTRATE_NAME = "lenia"   # options: 'boids', 'lenia', 'plife', 'plife_plus', 
+                            #          'plenia', 'dnca', 'nca_d1', 'nca_d3', 'gol'
+FM_NAME = "clip"   # options: 'clip', 'dino', 'pixels'
 
 PROMPTS = [
     "a butterfly",
@@ -32,8 +35,8 @@ PROMPTS = [
 
 # --- Extreme solutions (one per prompt, manually verified) ---
 EXTREME_PATHS = [
-    "\seed_butterfly\best.pkl",
-    "\seed_caterpillar\best.pkl",
+    "./best_seeds/seed_butterfly/best.pkl",
+    "./best_seeds/seed_caterpillar/best.pkl",
 ]
 
 # --- Parent generation from single-objective optima ---
@@ -58,13 +61,13 @@ BASE_SEED     = 42
 TIME_SAMPLING = 8
 
 # --- Bound expansion margins ---
-DYN_MARGIN  = 0.5
+DYN_MARGIN  = 2.0
 INIT_MARGIN = 1.0
 
 # --- Output paths ---
-CHECKPOINT_DIR = "checkpoints"
-ARCHIVE_PATH   = "archive.pkl"
-RESULT_DIR     = "results"
+CHECKPOINT_DIR = "./results/checkpoints"
+ARCHIVE_PATH   = "./results/archive.pkl"
+RESULT_DIR     = "./results/results"
 
 
 # =============================================================================
@@ -88,12 +91,17 @@ def load_extremes(extreme_paths: list[str]) -> np.ndarray:
             f"Run single_obj_search.py first, verify manually, "
             f"then update EXTREME_PATHS."
         )
-        x = np.load(path)
+        with open(path, "rb") as fp:
+            data = pickle.load(fp)
+
+        # data is always a tuple (x_star, fitness) from ASAL single-obj search
+        x = np.asarray(data[0], dtype=np.float64)
+        fitness = float(data[1])
+        print(f"[Load] Extreme {i} loaded from '{path}' | "
+              f"shape={x.shape} | fitness={fitness:.6f}")
+
         x_stars.append(x)
-        print(f"[Load] Extreme {i} loaded from '{path}' | shape: {x.shape}")
     return np.stack(x_stars)   # (n_prompts, n_var)
-
-
 # =============================================================================
 # Archive and checkpoint callback
 # =============================================================================
@@ -110,11 +118,13 @@ class ArchiveAndCheckpointCallback(Callback):
     """
 
     def __init__(self, archive_path: str, checkpoint_dir: str,
-                 initial_archive: list | None = None):
+                 initial_archive: list | None = None,
+                 save_every: int = 1):   # 默认每代保存
         super().__init__()
         self.archive_path   = archive_path
         self.checkpoint_dir = checkpoint_dir
         self.archive        = initial_archive or []
+        self.save_every     = save_every
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     def notify(self, algorithm):
@@ -123,29 +133,33 @@ class ArchiveAndCheckpointCallback(Callback):
         X_all = pop.get("X")
         F_all = pop.get("F")
 
+        # Always accumulate to archive in memory
         for x, f in zip(X_all, F_all):
             self.archive.append({"gen": gen, "X": x.copy(), "F": f.copy()})
 
-        with open(self.archive_path, "wb") as fp:
-            pickle.dump(self.archive, fp)
+        # Only write to disk every save_every generations
+        if gen % self.save_every == 0:
+            with open(self.archive_path, "wb") as fp:
+                pickle.dump(self.archive, fp)
 
-        ckpt = {"gen": gen, "pop_X": X_all.copy(), "pop_F": F_all.copy()}
+            ckpt = {"gen": gen, "pop_X": X_all.copy(), "pop_F": F_all.copy()}
 
-        ckpt_path = os.path.join(self.checkpoint_dir, f"ckpt_gen{gen:04d}.pkl")
-        with open(ckpt_path, "wb") as fp:
-            pickle.dump(ckpt, fp)
+            ckpt_path = os.path.join(self.checkpoint_dir, f"ckpt_gen{gen:04d}.pkl")
+            with open(ckpt_path, "wb") as fp:
+                pickle.dump(ckpt, fp)
 
-        latest_path = os.path.join(self.checkpoint_dir, "latest.pkl")
-        with open(latest_path, "wb") as fp:
-            pickle.dump(ckpt, fp)
+            latest_path = os.path.join(self.checkpoint_dir, "latest.pkl")
+            with open(latest_path, "wb") as fp:
+                pickle.dump(ckpt, fp)
 
         print(
             f"[NSGA-II | Gen {gen:04d}] "
             f"n_eval={algorithm.evaluator.n_eval} | "
             f"pareto={len(algorithm.opt)} | "
-            f"archive={len(self.archive)}"
+            f"archive={len(self.archive)} | "
+            f"best_sim=[{-algorithm.opt.get('F').min(axis=0)[0]:.4f}, "
+            f"{-algorithm.opt.get('F').min(axis=0)[1]:.4f}]"
         )
-
 
 # =============================================================================
 # Checkpoint helpers
@@ -223,11 +237,12 @@ def build_initial_population(
 def main():
 
     # ── 1. Substrate and foundation model ────────────────────────────────────
-    from substrates.lenia import Substrate, FlattenSubstrateParameters
-    from foundation_models.clip import FoundationModel
-
-    substrate = Substrate()
-    fm        = FoundationModel()
+    from substrates import create_substrate, FlattenSubstrateParameters
+    from foundation_models import create_foundation_model
+    
+    substrate     = create_substrate(SUBSTRATE_NAME)
+    param_cls     = FlattenSubstrateParameters(substrate)
+    fm            = create_foundation_model(FM_NAME)
 
     # ── 2. Text embeddings ────────────────────────────────────────────────────
     z_txt_list = encode_prompts(fm, PROMPTS)
@@ -239,8 +254,8 @@ def main():
     print("[Setup] Rollout function built and jitted.")
 
     # ── 4. Hard bounds from substrate ────────────────────────────────────────
-    global_xl, global_xu = get_substrate_bounds(FlattenSubstrateParameters)
-    print(f"[Setup] Substrate hard bounds: n_var={len(global_xl)}")
+    global_xl, global_xu = get_substrate_bounds(param_cls)
+    print(f"[Setup] Substrate hard bounds: not defined, using seed-based soft bounds only.")
 
     # ── 5. Load verified extreme solutions ───────────────────────────────────
     print("\n[Setup] Loading extreme solutions ...")
@@ -330,6 +345,7 @@ def main():
         archive_path=ARCHIVE_PATH,
         checkpoint_dir=CHECKPOINT_DIR,
         initial_archive=prior_archive,
+        save_every=100,
     )
 
     # ── 13. Run ───────────────────────────────────────────────────────────────
@@ -351,10 +367,14 @@ def main():
     np.save(os.path.join(RESULT_DIR, "pareto_X.npy"), res.X)
     np.save(os.path.join(RESULT_DIR, "pareto_F.npy"), res.F)
 
+    np.save(os.path.join(RESULT_DIR, "pareto_similarity.npy"), -res.F)
+    
     print(f"\n[Done] Optimisation complete.")
     print(f"       Pareto front size : {len(res.F)}")
     print(f"       Total archive size: {len(callback.archive)}")
-    print(f"       Results saved to  : {RESULT_DIR}/")
+    print(f"       Similarity scores (higher is better):")
+    for i, row in enumerate(-res.F):
+        print(f"         Solution {i:03d}: prompt_0={row[0]:.4f}, prompt_1={row[1]:.4f}")
 
 
 if __name__ == "__main__":
