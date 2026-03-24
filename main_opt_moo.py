@@ -1,6 +1,13 @@
 import os
-import pickle
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+import argparse
+
+import jax
+import jax.numpy as jnp
+from jax.random import split
 import numpy as np
+from functools import partial
+from tqdm.auto import tqdm
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.operators.crossover.sbx import SBX
@@ -11,371 +18,201 @@ from pymoo.core.evaluator import Evaluator
 from pymoo.core.callback import Callback
 from pymoo.optimize import minimize
 
+import substrates
+import foundation_models
+from rollout import rollout_simulation
 from problems.pymooproblem_definition import MOO_ASALProblem
-from eval_fn import (
-    encode_prompts,
-    build_rollout_fn,
-    get_substrate_bounds,
-    compute_bounds_from_seeds,
-    generate_parents_from_optimum,
-)
+from eval_fn import encode_prompts, build_rollout_fn, get_substrate_bounds
+import util
 
-# =============================================================================
-# Configuration
-# =============================================================================
+parser = argparse.ArgumentParser()
+group = parser.add_argument_group("meta")
+group.add_argument("--seed", type=int, default=0, help="the random seed")
+group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
 
-SUBSTRATE_NAME = "lenia"   # options: 'boids', 'lenia', 'plife', 'plife_plus', 
-                            #          'plenia', 'dnca', 'nca_d1', 'nca_d3', 'gol'
-FM_NAME = "clip"   # options: 'clip', 'dino', 'pixels'
+group = parser.add_argument_group("substrate")
+group.add_argument("--substrate", type=str, default='lenia', help="name of the substrate")
+group.add_argument("--rollout_steps", type=int, default=None, help="number of rollout timesteps, leave None for the default of the substrate")
 
-PROMPTS = [
-    "a butterfly",
-    "a caterpillar",
-]
+group = parser.add_argument_group("evaluation")
+group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use")
+group.add_argument("--time_sampling", type=int, default=8, help="number of images to render during one simulation rollout")
+group.add_argument("--prompts", type=str, default="a butterfly;a caterpillar", help="prompts to optimize for separated by ';'")
+group.add_argument("--n_evals", type=int, default=1, help="number of independent rollouts to average per evaluation")
 
-# --- Extreme solutions (one per prompt, manually verified) ---
-EXTREME_PATHS = [
-    "./best_seeds/seed_butterfly/best.pkl",
-    "./best_seeds/seed_caterpillar/best.pkl",
-]
+group = parser.add_argument_group("optimization")
+group.add_argument("--pop_size", type=int, default=64, help="population size for NSGA-II")
+group.add_argument("--n_gen", type=int, default=20000, help="number of generations to run")
+group.add_argument("--checkpoint_dir", type=str, default=None, help="directory for checkpoints (enables resume)")
+group.add_argument("--save_every", type=int, default=100, help="save checkpoint every N generations")
 
-# --- Parent generation from single-objective optima ---
-N_PARENTS_PER_PROMPT = 9      # 9 parents x 2 prompts = 18 parents total
-NOISE_SCALE          = 0.05   # 5% of per-dimension range as Gaussian noise std
+def parse_args(*args, **kwargs):
+    args = parser.parse_args(*args, **kwargs)
+    for k, v in vars(args).items():
+        if isinstance(v, str) and v.lower() == "none":
+            setattr(args, k, None)
+    return args
 
-# --- Population composition (must sum to POP_SIZE) ---
-# 2 extremes + 18 parents + 44 random = 64
-POP_SIZE   = 64
-N_EXTREMES = len(EXTREME_PATHS)
-N_PARENTS  = N_PARENTS_PER_PROMPT * len(EXTREME_PATHS)
-N_RANDOM   = POP_SIZE - N_EXTREMES - N_PARENTS
-
-assert N_RANDOM >= 0, (
-    f"Population oversubscribed: {N_EXTREMES} extremes + {N_PARENTS} parents "
-    f"> {POP_SIZE} pop_size. Reduce N_PARENTS_PER_PROMPT or increase POP_SIZE."
-)
-
-# --- Multi-objective optimisation ---
-N_GEN         = 20000
-BASE_SEED     = 42
-TIME_SAMPLING = 8
-
-# --- Bound expansion margins ---
-DYN_MARGIN  = 2.0
-INIT_MARGIN = 1.0
-
-# --- Output paths ---
-CHECKPOINT_DIR = "./results/checkpoints"
-ARCHIVE_PATH   = "./results/archive.pkl"
-RESULT_DIR     = "./results/results"
-
-
-# =============================================================================
-# Loaders
-# =============================================================================
-
-def load_extremes(extreme_paths: list[str]) -> np.ndarray:
-    """
-    Load and stack single-objective optimal solutions from the given paths.
-    Hard-fails if any path is missing to prevent silent fallback
-    to uninformed bounds.
-
-    Returns
-    -------
-    extremes : np.ndarray of shape (n_prompts, n_var)
-    """
-    x_stars = []
-    for i, path in enumerate(extreme_paths):
-        assert os.path.exists(path), (
-            f"Extreme solution for prompt {i} not found at '{path}'.\n"
-            f"Run single_obj_search.py first, verify manually, "
-            f"then update EXTREME_PATHS."
-        )
-        with open(path, "rb") as fp:
-            data = pickle.load(fp)
-
-        # data is always a tuple (x_star, fitness) from ASAL single-obj search
-        x = np.asarray(data[0], dtype=np.float64)
-        fitness = float(data[1])
-        print(f"[Load] Extreme {i} loaded from '{path}' | "
-              f"shape={x.shape} | fitness={fitness:.6f}")
-
-        x_stars.append(x)
-    return np.stack(x_stars)   # (n_prompts, n_var)
-# =============================================================================
-# Archive and checkpoint callback
-# =============================================================================
 
 class ArchiveAndCheckpointCallback(Callback):
-    """
-    After every generation:
-      - Appends every individual in the current population to the global archive.
-      - Saves the archive to disk.
-      - Saves a generation checkpoint for resume support.
-
-    Archive entry format:
-        {'gen': int, 'X': np.ndarray (n_var,), 'F': np.ndarray (n_obj,)}
-    """
-
-    def __init__(self, archive_path: str, checkpoint_dir: str,
-                 initial_archive: list | None = None,
-                 save_every: int = 1):   # 默认每代保存
+    def __init__(self, save_dir, checkpoint_dir, save_every=100, initial_archive=None):
         super().__init__()
-        self.archive_path   = archive_path
+        self.save_dir = save_dir
         self.checkpoint_dir = checkpoint_dir
-        self.archive        = initial_archive or []
-        self.save_every     = save_every
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        self.save_every = save_every
+        self.archive = initial_archive or []
+        if checkpoint_dir is not None:
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
     def notify(self, algorithm):
-        gen   = algorithm.n_gen
-        pop   = algorithm.pop
+        gen = algorithm.n_gen
+        pop = algorithm.pop
         X_all = pop.get("X")
         F_all = pop.get("F")
 
-        # Always accumulate to archive in memory
         for x, f in zip(X_all, F_all):
             self.archive.append({"gen": gen, "X": x.copy(), "F": f.copy()})
 
-        # Only write to disk every save_every generations
-        if gen % self.save_every == 0:
-            with open(self.archive_path, "wb") as fp:
-                pickle.dump(self.archive, fp)
+        if self.save_dir is not None:
+            util.save_pkl(self.save_dir, "archive", self.archive)
 
+        if gen % self.save_every == 0 and self.checkpoint_dir is not None:
             ckpt = {"gen": gen, "pop_X": X_all.copy(), "pop_F": F_all.copy()}
+            util.save_pkl(self.checkpoint_dir, f"ckpt_gen{gen:04d}", ckpt)
+            util.save_pkl(self.checkpoint_dir, "latest", ckpt)
 
-            ckpt_path = os.path.join(self.checkpoint_dir, f"ckpt_gen{gen:04d}.pkl")
-            with open(ckpt_path, "wb") as fp:
-                pickle.dump(ckpt, fp)
+            if self.checkpoint_dir is not None:
+                ckpt = {"gen": gen, "pop_X": X_all.copy(), "pop_F": F_all.copy()}
+                util.save_pkl(self.checkpoint_dir, f"ckpt_gen{gen:04d}", ckpt)
+                util.save_pkl(self.checkpoint_dir, "latest", ckpt)
 
-            latest_path = os.path.join(self.checkpoint_dir, "latest.pkl")
-            with open(latest_path, "wb") as fp:
-                pickle.dump(ckpt, fp)
-
+        # Pareto 前沿上的解
+        pareto_F = algorithm.opt.get("F")           # (n_pareto, n_obj)
+        pareto_sim = -pareto_F                       # 转为 similarity，越大越好
+        best_sim = pareto_sim.max(axis=0)            # 每个目标的最优 similarity
+        mean_sim = pareto_sim.mean(axis=0)           # Pareto 前沿的平均 similarity
+    
         print(
             f"[NSGA-II | Gen {gen:04d}] "
-            f"n_eval={algorithm.evaluator.n_eval} | "
-            f"pareto={len(algorithm.opt)} | "
+            f"pareto={len(pareto_F)} | "
             f"archive={len(self.archive)} | "
-            f"best_sim=[{-algorithm.opt.get('F').min(axis=0)[0]:.4f}, "
-            f"{-algorithm.opt.get('F').min(axis=0)[1]:.4f}]"
+            f"best_sim=[{', '.join(f'{v:.4f}' for v in best_sim)}] | "
+            f"mean_sim=[{', '.join(f'{v:.4f}' for v in mean_sim)}]",
+            flush=True
         )
 
-# =============================================================================
-# Checkpoint helpers
-# =============================================================================
 
-def load_latest_checkpoint(checkpoint_dir: str) -> dict | None:
+def load_latest_checkpoint(checkpoint_dir):
+    if checkpoint_dir is None:
+        return None
     latest_path = os.path.join(checkpoint_dir, "latest.pkl")
     if not os.path.exists(latest_path):
         return None
-    with open(latest_path, "rb") as fp:
-        ckpt = pickle.load(fp)
-    print(f"[Resume] Loaded checkpoint at generation {ckpt['gen']} "
-          f"({len(ckpt['pop_X'])} individuals)")
+    ckpt = util.load_pkl(checkpoint_dir, "latest")
+    print(f"[Resume] Checkpoint at gen {ckpt['gen']} ({len(ckpt['pop_X'])} individuals)")
     return ckpt
 
 
-def load_archive(archive_path: str) -> list | None:
-    if not os.path.exists(archive_path):
-        return None
-    with open(archive_path, "rb") as fp:
-        archive = pickle.load(fp)
-    print(f"[Resume] Loaded existing archive ({len(archive)} entries)")
-    return archive
+def main(args):
+    prompts = args.prompts.split(";")
+    if args.time_sampling < len(prompts):
+        args.time_sampling = len(prompts)
+    print(args)
 
+    fm = foundation_models.create_foundation_model(args.foundation_model)
+    substrate = substrates.create_substrate(args.substrate)
+    substrate = substrates.FlattenSubstrateParameters(substrate)
+    if args.rollout_steps is not None:
+        substrate.rollout_steps = args.rollout_steps
 
-# =============================================================================
-# Initial population
-# =============================================================================
+    rollout_fn = build_rollout_fn(substrate, fm, time_sampling=args.time_sampling)
+    z_txt_list = encode_prompts(fm, prompts)
+    print(f"[Setup] {len(z_txt_list)} prompts encoded, dim={z_txt_list[0].shape[-1]}")
 
-def build_initial_population(
-    problem: MOO_ASALProblem,
-    extremes: np.ndarray,
-    parents: np.ndarray,
-    n_random: int,
-    rng: np.random.Generator,
-) -> Population:
-    """
-    Compose the initial population from three sources:
-      1. Single-objective extreme solutions  (2)  — Pareto corner anchors
-      2. Parent pool from Gaussian expansion (18) — neighbourhood of optima
-      3. Random fill                         (44) — diversity
+    xl, xu = get_substrate_bounds(substrate)
+    if xl is None:
+        raise RuntimeError(f"Could not determine bounds for substrate '{args.substrate}'.")
 
-    All individuals are clipped to [xl, xu] and evaluated before
-    being handed to NSGA-II.
-    """
-    random_X = rng.uniform(
-        problem.xl, problem.xu,
-        size=(n_random, problem.n_var)
-    )
-
-    all_X = np.vstack([
-        np.atleast_2d(extremes),   # (2,  n_var)
-        np.atleast_2d(parents),    # (18, n_var)
-        random_X,                  # (44, n_var)
-    ])
-
-    all_X = np.clip(all_X, problem.xl, problem.xu)
-
-    print(
-        f"[Init] Population composed: "
-        f"{len(extremes)} extreme(s) + "
-        f"{len(parents)} parent(s) + "
-        f"{n_random} random = {len(all_X)} total"
-    )
-
-    pop = Population.new("X", all_X)
-    Evaluator().eval(problem, pop)
-    return pop
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
-def main():
-
-    # ── 1. Substrate and foundation model ────────────────────────────────────
-    from substrates import create_substrate, FlattenSubstrateParameters
-    from foundation_models import create_foundation_model
-    
-    substrate     = create_substrate(SUBSTRATE_NAME)
-    param_cls     = FlattenSubstrateParameters(substrate)
-    fm            = create_foundation_model(FM_NAME)
-
-    # ── 2. Text embeddings ────────────────────────────────────────────────────
-    z_txt_list = encode_prompts(fm, PROMPTS)
-    print(f"[Setup] Encoded {len(z_txt_list)} prompts, "
-          f"embedding dim = {z_txt_list[0].shape[-1]}")
-
-    # ── 3. Rollout function ───────────────────────────────────────────────────
-    rollout_fn = build_rollout_fn(substrate, fm, time_sampling=TIME_SAMPLING)
-    print("[Setup] Rollout function built and jitted.")
-
-    # ── 4. Hard bounds from substrate ────────────────────────────────────────
-    global_xl, global_xu = get_substrate_bounds(param_cls)
-    print(f"[Setup] Substrate hard bounds: not defined, using seed-based soft bounds only.")
-
-    # ── 5. Load verified extreme solutions ───────────────────────────────────
-    print("\n[Setup] Loading extreme solutions ...")
-    extremes = load_extremes(EXTREME_PATHS)
-    print(f"[Setup] Extremes loaded: shape={extremes.shape}")
-
-    # ── 6. Generate parent pool from optima via Gaussian perturbation ─────────
-    parents_list = []
-    for i, x_star in enumerate(extremes):
-        p = generate_parents_from_optimum(
-            x_star=x_star,
-            n_parents=N_PARENTS_PER_PROMPT,
-            noise_scale=NOISE_SCALE,
-            xl=global_xl,
-            xu=global_xu,
-            rng=np.random.default_rng(BASE_SEED + i),
-        )
-        parents_list.append(p)
-        print(f"[Setup] Generated {len(p)} parents for prompt {i} "
-              f"(noise_scale={NOISE_SCALE})")
-
-    parents = np.vstack(parents_list)   # (18, n_var)
-
-    # ── 7. Compute search bounds ──────────────────────────────────────────────
-    # Use extremes + parents as seeds so the bounds cover the full
-    # initial population distribution
-    all_seeds = np.vstack([extremes, parents])
-    xl, xu = compute_bounds_from_seeds(
-        substrate=substrate,
-        seeds=all_seeds,
-        dyn_margin=DYN_MARGIN,
-        init_margin=INIT_MARGIN,
-        global_xl=global_xl,
-        global_xu=global_xu,
-    )
-    print("[Setup] Search bounds computed from extremes + parents.")
-
-    # ── 8. Problem ────────────────────────────────────────────────────────────
     problem = MOO_ASALProblem(
         rollout_fn=rollout_fn,
         z_txt_list=z_txt_list,
         xl=xl,
         xu=xu,
-        base_seed=BASE_SEED,
+        base_seed=args.seed,
+        n_evals=args.n_evals,
     )
-    print(f"[Setup] Problem ready: n_var={problem.n_var}, n_obj={problem.n_obj}")
+    print(f"[Setup] Problem: n_var={problem.n_var}, n_obj={problem.n_obj}")
 
-    # ── 9. Checkpoint / resume ────────────────────────────────────────────────
-    ckpt          = load_latest_checkpoint(CHECKPOINT_DIR)
-    prior_archive = load_archive(ARCHIVE_PATH)
-    start_gen     = ckpt["gen"] if ckpt is not None else 0
-    remaining_gen = N_GEN - start_gen
+    ckpt = load_latest_checkpoint(args.checkpoint_dir)
+    start_gen = ckpt["gen"] if ckpt is not None else 0
+    remaining_gen = args.n_gen - start_gen
 
     if remaining_gen <= 0:
-        print(f"[Done] All {N_GEN} generations already completed.")
+        print(f"[Done] All {args.n_gen} generations already completed.")
         return
 
-    # ── 10. NSGA-II ───────────────────────────────────────────────────────────
     algorithm = NSGA2(
-        pop_size=POP_SIZE,
+        pop_size=args.pop_size,
         sampling=FloatRandomSampling(),
         crossover=SBX(prob=0.9, eta=15),
         mutation=PM(eta=20),
-        eliminate_duplicates=True,
+        eliminate_duplicates=False,
     )
-
-    # ── 11. Population injection ──────────────────────────────────────────────
-    rng = np.random.default_rng(BASE_SEED)
 
     if ckpt is not None:
         resume_pop = Population.new("X", ckpt["pop_X"], "F", ckpt["pop_F"])
         algorithm.initialization.sampling = resume_pop
-        print(f"[Resume] Resuming from generation {start_gen}, "
-              f"{remaining_gen} generations remaining.")
+        prior_archive = util.load_pkl(args.save_dir, "archive") if args.save_dir else None
+        print(f"[Resume] Resuming from gen {start_gen}, {remaining_gen} gens remaining.")
     else:
-        init_pop = build_initial_population(
-            problem=problem,
-            extremes=extremes,
-            parents=parents,
-            n_random=N_RANDOM,
-            rng=rng,
-        )
-        algorithm.initialization.sampling = init_pop
+        prior_archive = None
 
-    # ── 12. Callback ──────────────────────────────────────────────────────────
     callback = ArchiveAndCheckpointCallback(
-        archive_path=ARCHIVE_PATH,
-        checkpoint_dir=CHECKPOINT_DIR,
+        save_dir=args.save_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
         initial_archive=prior_archive,
-        save_every=100,
     )
 
-    # ── 13. Run ───────────────────────────────────────────────────────────────
-    print(f"\n[Run] NSGA-II | pop={POP_SIZE} | "
-          f"n_gen={remaining_gen} | n_obj={problem.n_obj}")
+    print(f"\n[Run] NSGA-II | pop={args.pop_size} | n_gen={remaining_gen} | n_obj={problem.n_obj}")
     print("=" * 60)
 
     res = minimize(
         problem,
         algorithm,
         termination=("n_gen", remaining_gen),
-        seed=BASE_SEED,
+        seed=args.seed,
         callback=callback,
         verbose=False,
     )
 
-    # ── 14. Save results ──────────────────────────────────────────────────────
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    np.save(os.path.join(RESULT_DIR, "pareto_X.npy"), res.X)
-    np.save(os.path.join(RESULT_DIR, "pareto_F.npy"), res.F)
+    if args.save_dir is not None:
+        util.save_pkl(args.save_dir, "pareto_X", res.X)
+        util.save_pkl(args.save_dir, "pareto_F", res.F)
+        util.save_pkl(args.save_dir, "archive", callback.archive)
 
-    np.save(os.path.join(RESULT_DIR, "pareto_similarity.npy"), -res.F)
-    
     print(f"\n[Done] Optimisation complete.")
     print(f"       Pareto front size : {len(res.F)}")
     print(f"       Total archive size: {len(callback.archive)}")
     print(f"       Similarity scores (higher is better):")
     for i, row in enumerate(-res.F):
-        print(f"         Solution {i:03d}: prompt_0={row[0]:.4f}, prompt_1={row[1]:.4f}")
+        labels = [f"prompt_{j}={v:.4f}" for j, v in enumerate(row)]
+        print(f"         Solution {i:03d}: {' | '.join(labels)}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main(parse_args())
+
+# python main_opt_moo.py \
+#     --seed 0 \                        # 随机种子
+#     --save_dir ./results \            # 结果保存目录 (pareto_X, pareto_F, archive)
+#     --substrate lenia \               # substrate名称
+#     --foundation_model clip \         # 基础模型
+#     --time_sampling 8 \               # 每次rollout采样的帧数
+#     --prompts "a butterfly;a caterpillar" \  # 多目标prompt，用;分隔
+#     --n_evals 1 \                     # 每个解评估的rollout次数
+#     --pop_size 64 \                   # NSGA-II种群大小
+#     --n_gen 20000 \                   # 总代数
+#     --checkpoint_dir ./checkpoints \  # checkpoint目录 (支持断点续跑)
+#     --save_every 100                  # 每100代保存一次checkpoint
+#python main_opt_moo.py --seed 0 --save_dir ./results --substrate lenia --foundation_model clip --time_sampling 8 --prompts "a butterfly;a caterpillar" --n_evals 1 --pop_size 64 --n_gen 20000 --checkpoint_dir ./checkpoints --save_every 100
