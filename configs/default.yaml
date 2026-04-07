@@ -1,0 +1,27 @@
+meta:
+  seed: 0
+  save_dir: ./results8
+
+substrate:
+  substrate: lenia
+  rollout_steps: null
+
+evaluation:
+  foundation_model: clip
+  time_sampling: 8
+  prompts: "a spiral;a blob creature"
+  n_evals: 1
+
+optimization:
+  algorithm: moead
+  pop_size: 64
+  n_gen: 10000
+  checkpoint_dir: ./results8/checkpoints
+  save_every: 100
+  n_neighbors: 20
+  decomposition: pbi
+  n_partitions: 12
+  crossover_prob: 0.9
+  crossover_eta: 10
+  mutation_prob: 0.2
+  mutation_eta: 10
